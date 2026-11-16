@@ -516,7 +516,10 @@ with st.sidebar:
     st.header("⚙️ Knowledge & settings")
     if storage_error:
         st.error("Private knowledge store is unavailable. Check the GitHub repository name, token and permissions.")
-    st.success("✅ Permanent private knowledge store connected") if persistent and not storage_error else st.warning("⚠️ Temporary mode — documents may be lost on restart. Configure private storage.")
+    if persistent and not storage_error:
+        st.success("✅ Private knowledge repository connected (read access verified).")
+    else:
+        st.warning("⚠️ Temporary mode — documents may be lost on restart. Configure private storage.")
     st.metric("Saved documents", len(docs))
     st.metric("Saved pages", sum(len(d.get("pages", [])) for d in docs))
     if setting("GEMINI_API_KEY"):

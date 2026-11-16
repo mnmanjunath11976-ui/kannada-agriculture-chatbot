@@ -70,7 +70,7 @@ def read_pdf(file_bytes, filename, client, use_ocr, progress):
             origin = "Gemini OCR"
         if extracted:
             pages.append({"source": filename, "page": i + 1, "text": extracted, "method": origin})
-        progress((i + 1) / max(len(doc), 1), text=f"{filename}: page {i + 1}/{len(doc)}")
+        progress.progress((i + 1) / max(len(doc), 1), text=f"{filename}: page {i + 1}/{len(doc)}")
     count = len(doc)
     doc.close()
     return pages, count
@@ -113,7 +113,7 @@ def embed_documents(client, chunks, progress):
             config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", output_dimensionality=768),
         )
         vectors.extend([v.values for v in result.embeddings])
-        progress((start + len(batch)) / len(chunks), text=f"Indexing: {start + len(batch)}/{len(chunks)}")
+        progress.progress((start + len(batch)) / len(chunks), text=f"Indexing: {start + len(batch)}/{len(chunks)}")
     return np.asarray(vectors, dtype=np.float32)
 
 
@@ -122,7 +122,7 @@ def initialize_index(chunks, client, progress):
     # Character ngrams help with both Kannada and English and give an API-free fallback.
     tfidf = TfidfVectorizer(analyzer="char", ngram_range=(2, 5), max_features=140000, sublinear_tf=True)
     tfidf_matrix = tfidf.fit_transform(corpus)
-    progress(0.05, text="Creating retrieval index…")
+    progress.progress(0.05, text="Creating retrieval index…")
     embeddings = None
     warning = ""
     try:

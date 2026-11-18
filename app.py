@@ -29,6 +29,7 @@ from gtts import gTTS
 from google import genai
 from google.genai import types
 from retrieval import HybridIndex, contextual_query, likely_document_question
+from catalogue import is_catalogue_question, catalogue_inventory, catalogue_answer
 
 st.set_page_config(page_title="ಕೃಷಿ ಜ್ಞಾನ | Agri Knowledge Hub", page_icon="🌾", layout="wide", initial_sidebar_state="expanded")
 st.markdown('''<style>
@@ -593,11 +594,22 @@ if q:
     greeting = is_greeting(q)
     routed_doc = mode.startswith("Documents") or (mode.startswith("Auto") and bool(docs) and is_document_question(q))
     lookup_q = contextual_query(q, st.session_state.chat[:-1]) if routed_doc else q
-    found, diagnostics = find_sources(lookup_q, index) if routed_doc else ([], {})
+    catalogue_mode = routed_doc and is_catalogue_question(q)
+    found, diagnostics = find_sources(lookup_q, index) if routed_doc and not catalogue_mode else ([], {})
     warning = None
     with st.spinner("Searching saved knowledge / ಉತ್ತರ ಹುಡುಕುತ್ತಿದೆ…"):
         if routed_doc:
-            if diagnostics.get("quality") == "weak" and found:
+            if catalogue_mode:
+                crop_rows, pages_scanned = catalogue_inventory(chunks)
+                ans = catalogue_answer(crop_rows, pages_scanned, len(docs), any('\u0c80' <= x <= '\u0cff' for x in q))
+                # Show evidence for crop detections in the existing source passages control.
+                found = [s for row in crop_rows for s in row['evidence'][:1]][:60]
+                diagnostics = {"mode":"Full-collection crop-name scan (no Gemini call)",
+                               "crop_names_found":len(crop_rows),
+                               "pages_scanned":pages_scanned,
+                               "indexed_passages":len(chunks),
+                               "limitations":"List is based on recognized crop vocabulary and OCR/translated text; may be incomplete."}
+            elif diagnostics.get("quality") == "weak" and found:
                 st.info("Search matches are weak. Please verify source passages before using agricultural quantities.")
             if not found:
                 ans = "ಈ ಪ್ರಶ್ನೆಗೆ ಹೊಂದುವ ಮಾಹಿತಿ ಸಂಗ್ರಹಿತ ದಾಖಲೆಗಳಲ್ಲಿ ಕಂಡುಬಂದಿಲ್ಲ." if any('\u0c80' <= x <= '\u0cff' for x in q) else "I couldn't find a relevant passage in the saved documents. Try different terms."

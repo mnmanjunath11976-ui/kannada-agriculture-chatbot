@@ -30,6 +30,9 @@ from google import genai
 from google.genai import types
 from retrieval import HybridIndex, contextual_query, likely_document_question
 from catalogue import is_catalogue_question, catalogue_inventory, catalogue_answer
+from document_ingest import extract_upload, SUPPORTED
+import spread_ocr as spread
+from semantic_v7 import PROVIDERS, index_batch as neural_index_batch, semantic_search as neural_search, combine_ranked, load_manifest as neural_manifest, chunk_id as neural_chunk_id
 
 st.set_page_config(page_title="ಕೃಷಿ ಜ್ಞಾನ | Agri Knowledge Hub", page_icon="🌾", layout="wide", initial_sidebar_state="expanded")
 st.markdown('''<style>
@@ -202,11 +205,69 @@ def generate(contents, system=None, temperature=0.1):
     raise RuntimeError(message_for_error(final)) from final
 
 
+def google_cloud_translate_text(text):
+    """Official Google Cloud Translation Basic API. An API key and billing may be required."""
+    api_key = setting("GOOGLE_TRANSLATE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_TRANSLATE_API_KEY is missing in Streamlit Secrets")
+    response = requests.post(
+        "https://translation.googleapis.com/language/translate/v2",
+        params={"key": api_key},
+        json={"q": text, "source": "kn", "target": "en", "format": "text"},
+        timeout=45,
+    )
+    response.raise_for_status()
+    import html
+    translations=response.json().get('data',{}).get('translations',[])
+    if not translations or not translations[0].get('translatedText'):
+        raise RuntimeError('Google Cloud Translation returned no text')
+    return html.unescape(translations[0]['translatedText'])
+
+
 def make_english(text):
+    # Always save Kannada separately. If translation fails, it remains PENDING.
+    if not (text or '').strip(): return ''
+    provider=setting('TRANSLATION_PROVIDER','gemini').lower()
     try:
-        return generate(TRANSLATE_PROMPT + text[:8500], temperature=0)
+        if provider=='google_cloud':
+            # API size limits: translate bounded segments, no silent truncation.
+            paragraphs=text.split('\n'); batches=[]; cur=''
+            for para in paragraphs:
+                while len(para)>3000:
+                    if cur: batches.append(cur);cur=''
+                    batches.append(para[:3000]);para=para[3000:]
+                if cur and len(cur)+len(para)>3000: batches.append(cur);cur=''
+                cur+=para+'\n'
+            if cur.strip(): batches.append(cur)
+            return '\n'.join(google_cloud_translate_text(b) for b in batches)
+        if provider=='gemini':
+            # Long text must be processed in full: no silent 8500-character truncation.
+            parts=[]; cur=''
+            for paragraph in text.split('\n'):
+                while len(paragraph)>4000:
+                    if cur: parts.append(cur); cur=''
+                    parts.append(paragraph[:4000]);paragraph=paragraph[4000:]
+                if cur and len(cur)+len(paragraph)>4000:parts.append(cur);cur=''
+                cur+=paragraph+'\n'
+            if cur.strip():parts.append(cur)
+            translated=[]
+            for part in parts:
+                out=generate(TRANSLATE_PROMPT + part, temperature=0)
+                if not out.strip():return ''
+                translated.append(out)
+            return '\n'.join(translated)
+        if provider=='indictrans2':
+            endpoint=setting('INDICTRANS2_URL')
+            if not endpoint or not endpoint.startswith('https://'):
+                raise ValueError('INDICTRANS2_URL must be an authenticated HTTPS translation endpoint')
+            token=setting('INDICTRANS2_TOKEN')
+            if not token: raise ValueError('INDICTRANS2_TOKEN is not configured')
+            response=requests.post(endpoint.rstrip('/')+'/translate',json={'text':text,'source':'kan_Knda','target':'eng_Latn'},headers={'Authorization':'Bearer '+token},timeout=120)
+            response.raise_for_status()
+            return response.json().get('translation','')
+        raise ValueError('Use TRANSLATION_PROVIDER=gemini, google_cloud or indictrans2')
     except Exception:
-        return ""  # kept as pending, not a fabricated translation
+        return ''  # do NOT store failed translation as completed
 
 
 def do_ocr_blob(blob):
@@ -271,7 +332,7 @@ def chunks_from_document(doc):
             source = kn[i:i+1350]
             translated = en[i:i+1350]
             if source or translated:
-                out.append({"filename": doc["name"], "page": p["number"], "kn": source, "en": translated, "docid": doc["id"]})
+                out.append({"filename": doc["name"], "page": p["number"], "kn": source, "en": translated, "docid": doc["id"], "source_location": p.get("source_location", "")})
     return out
 
 
@@ -382,6 +443,134 @@ def ingest_pdf(file, store, known_docs, auto_translate=False):
     st.session_state.store_version = st.session_state.get("store_version", 0) + 1
 
 
+def spread_ocr_call(image_bytes, loc):
+    if st.session_state.get("quota_blocked"):
+        raise RuntimeError("Gemini quota exhausted")
+    prompt = (
+        "Transcribe every visible Kannada and English word on this image of ONE printed "
+        "agricultural handbook page. Read columns in correct order. Reconstruct all table "
+        "cells and row labels in Markdown. Preserve ALL crop names, units, decimal points, "
+        "dosages, numerical ranges, variety names, captions, footnotes and page numbers. "
+        "Do not translate or invent. Mark unreadable spans [ಅಸ್ಪಷ್ಟ]. Return only the transcription. "
+        f"Image is {loc['source_location']}."
+    )
+    return generate([types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"), prompt], temperature=0)
+
+
+def spread_translation(source):
+    # The old translator silently truncated at 8,500 characters. Translate
+    # in complete bounded segments and keep pending if any segment fails.
+    parts = []
+    paragraphs = source.split("\n")
+    current = ""
+    for paragraph in paragraphs:
+        if len(current) + len(paragraph) > 4500 and current:
+            parts.append(current)
+            current = ""
+        while len(paragraph) > 4500:
+            parts.append(paragraph[:4500])
+            paragraph = paragraph[4500:]
+        current += paragraph + "\n"
+    if current.strip(): parts.append(current)
+    translations=[]
+    for part in parts:
+        translated=make_english(part)
+        if not translated: return ""
+        translations.append(translated)
+    return "\n".join(translations)
+
+
+def spread_record_pages(store, meta):
+    prefix=f"{ROOT}/docs/{meta['id']}"
+    pages=[]
+    for n in range(meta.get('batches', 0)):
+        pages.extend(spread.read_json(store, f"{prefix}/batch_{n:04d}.json", []) or [])
+    return pages
+
+
+def new_spread_upload(file, store):
+    if not persistent:
+        raise RuntimeError("Private GitHub storage is required to keep the source PDF across sessions")
+    data=file.getvalue()
+    if len(data)>75_000_000:
+        raise ValueError("This version supports PDFs up to 75 MB. Please compress larger scans")
+    meta, created=spread.start_document(store, ROOT, file.name, data, layout='auto')
+    st.success(f"{'Registered new' if created else 'Existing'} spread-aware PDF: {meta['total_pages']} logical pages. Source backed up in private repository.")
+    st.session_state.store_version=st.session_state.get('store_version',0)+1
+
+
+def run_spread_batch(store, meta, limit):
+    result=spread.process_next(store, ROOT, meta, spread_ocr_call, None, max_logical_pages=limit)
+    st.session_state.store_version=st.session_state.get('store_version',0)+1
+    return result
+
+
+def run_spread_translation(store, doc, limit=8):
+    prefix=f"{ROOT}/docs/{doc['id']}"
+    pending=0
+    pages=doc['pages']
+    for p in pages:
+        if pending>=limit or st.session_state.get('quota_blocked'): break
+        if p.get('kn') and not p.get('en'):
+            translated=spread_translation(p['kn'])
+            if not translated: break
+            # Compare numerical tokens; a mismatch requires review, not silent trust.
+            number_pattern=r"(?<![\w])\d+(?:[.,]\d+)?(?![\w])"
+            before=set(re.findall(number_pattern,p['kn']))
+            after=set(re.findall(number_pattern,translated))
+            p['en']=translated
+            p['translation_pending']=False
+            p['translation_review']=bool(before-after)
+            bnum=(p['number']-1)//spread.BATCH_SIZE
+            path=f'{prefix}/batch_{bnum:04d}.json'
+            group=spread.read_json(store,path,[]) or []
+            group=[p if x['number']==p['number'] else x for x in group]
+            spread.write_json(store,path,group,f'Translate logical page {p["number"]}')
+            pending+=1
+    st.session_state.store_version=st.session_state.get('store_version',0)+1
+    return pending
+
+
+def ingest_any(file, store, known_docs, auto_translate=False):
+    """Preserve existing knowledge/v2 structure; skip duplicate content by SHA256."""
+    if file.name.lower().endswith('.pdf'):
+        return ingest_pdf(file, store, known_docs, auto_translate)
+    data = file.getvalue()
+    docid = hashlib.sha256(data).hexdigest()[:24]
+    if next((d for d in known_docs if d.get('id') == docid and d.get('status') == 'ready'), None):
+        st.info(f"Already saved: {file.name}. No reprocessing required.")
+        return
+    pages = extract_upload(file.name, data)
+    record = json_read(store, f"{ROOT}/docs/{docid}/meta.json", None)
+    if record and record.get('status') == 'ready':
+        st.info(f"Already saved: {file.name}.")
+        return
+    if record and record.get('stored_pages', 0):
+        start = record['stored_pages']
+    else:
+        start = 0
+        record = {"id": docid, "name": file.name, "total_pages": len(pages),
+                  "stored_pages": 0, "batches": 0, "status": "processing",
+                  "added_utc": datetime.now(timezone.utc).isoformat(),
+                  "page_unit": "logical text sections"}
+        json_write(store, f"{ROOT}/docs/{docid}/meta.json", record, "Start indexing document")
+        ensure_registered(store, record)
+    progress = st.progress(start / max(1,len(pages)), text=f"Indexing {file.name}")
+    for i in range(start, len(pages), 5):
+        batch = pages[i:i+5]
+        if auto_translate:
+            for page in batch:
+                if page.get('translation_pending') and not st.session_state.get('quota_blocked', False):
+                    page['en'] = make_english(page['kn'])
+                    page['translation_pending'] = not bool(page['en'])
+        save_document(store, record, batch)
+        progress.progress(min(1, record['stored_pages']/max(1,len(pages))), text=f"{file.name}: {record['stored_pages']}/{len(pages)} text sections")
+    record['status'] = 'ready'
+    json_write(store, f"{ROOT}/docs/{docid}/meta.json", record, "Finish indexing document")
+    st.success(f"Saved {file.name}: {record['stored_pages']} searchable sections. Future visits reuse saved text.")
+    st.session_state.store_version = st.session_state.get('store_version', 0) + 1
+
+
 def repair_translation(doc, store):
     pending = 0
     pages = doc.get("pages", [])
@@ -430,7 +619,7 @@ def conversational_answer(q):
 
 
 def doc_answer(q, sources):
-    block = "\n\n".join(f"[{i}] {s['filename']} — Page {s['page']}\nKannada:\n{s['kn']}\nEnglish translation:\n{s['en']}" for i, s in enumerate(sources, 1))
+    block = "\n\n".join(f"[{i}] {s['filename']} — {s.get('source_location') or ('Page '+str(s['page']))}\nKannada:\n{s['kn']}\nEnglish translation:\n{s['en']}" for i, s in enumerate(sources, 1))
     return generate(f"SOURCES:\n{block[:17500]}\n\nUSER QUESTION: {q}", system=GROUND_RULES)
 
 
@@ -442,7 +631,7 @@ def fallback_sources(sources, query):
     lines = [intro]
     for i, s in enumerate(sources[:3], 1):
         snippet = (s.get("kn") if kn else (s.get("en") or s.get("kn"))) or ""
-        lines.append(f"**[{i}] {s['filename']} — p. {s['page']}**\n\n{snippet[:950]}")
+        lines.append(f"**[{i}] {s['filename']} — {s.get('source_location') or ('p. '+str(s['page']))}**\n\n{snippet[:950]}")
     return "\n\n".join(lines)
 
 
@@ -462,7 +651,7 @@ def voice_question(audio_bytes):
 
 
 # ----------------------------- UI -----------------------------
-st.markdown('<div class="hero"><h1>🌾 ಕನ್ನಡ ಕೃಷಿ ಜ್ಞಾನ ಸಹಾಯಕ</h1><p>Permanent PDF knowledge • Kannada + English • Ask, listen, and verify original sources</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>🌾 ಕನ್ನಡ ಕೃಷಿ ಜ್ಞಾನ ಸಹಾಯಕ</h1><p>Permanent multi-format knowledge • Kannada + English • Ask, listen, and verify original sources</p></div>', unsafe_allow_html=True)
 # Password gate is required for connected private knowledge stores.
 if setting("GITHUB_TOKEN") and setting("GITHUB_REPO"):
     password = setting("APP_PASSWORD")
@@ -506,18 +695,66 @@ with st.sidebar:
     else:
         st.warning("Add GEMINI_API_KEY in Streamlit Secrets for OCR, translation, AI and voice questions.")
     st.divider()
-    st.caption("🔍 Hybrid retrieval uses local BM25 + Kannada/English crop synonyms + TF-IDF. No Gemini embedding requests.")
-    st.subheader("📥 Add PDF to knowledge")
-    files = st.file_uploader("Upload Kannada / English PDFs", type=["pdf"], accept_multiple_files=True,
-                             help="On successful indexing, OCR and searchable content are saved to the private knowledge repository.")
+    st.caption("🔍 V7 hybrid retrieval: BM25 + synonyms + TF-IDF; optional stored Gemini Embedding 2 or BGE-M3 semantic vectors.")
+    st.subheader("📖 High-accuracy Kannada book OCR")
+    st.caption("For landscape books with two printed pages side by side. Original PDFs are backed up privately; OCR, page sides and translations are checkpointed.")
+    spread_pdf=st.file_uploader("Upload spread / old-font Kannada PDF",type=["pdf"],key="spread_source")
+    if spread_pdf and st.button("📚 Register PDF and back up original",use_container_width=True):
+        try:
+            new_spread_upload(spread_pdf,store)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Could not register: {type(e).__name__}: {str(e)[:180]}")
+    spread_docs=[d for d in docs if d.get("pipeline_version")==spread.VERSION]
+    if spread_docs:
+        chosen=st.selectbox("Select book for OCR/translation",spread_docs,
+                            format_func=lambda d:f"{d['name']} — {d.get('stored_pages',0)}/{d.get('total_pages',0)}")
+        logical_pages=chosen.get('pages',[])
+        stats=spread.audit(logical_pages)
+        st.caption(f"Pages with text: {stats['indexed_text_pages']} | OCR review: {stats['ocr_needs_review']} | Pending OCR: {stats['pending']} | Missing English: {stats['english_missing']}")
+        limit=st.select_slider("Pages per batch",options=[4,8,12,20],value=8)
+        if chosen.get('stored_pages',0)<chosen.get('total_pages',0):
+            if st.button("🔍 Process next pages (OCR)",use_container_width=True):
+                try:
+                    with st.spinner("Reading page images and checkpointing each side..."):
+                        batch=run_spread_batch(store,chosen,limit)
+                    st.success(f"Processed {len(batch)} page sides; pending/review pages remain visible")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"OCR batch error: {type(e).__name__}: {str(e)[:180]}")
+        if stats['pending']:
+            pending=[p for p in logical_pages if p.get('ocr_status')=='pending']
+            target=st.selectbox("Retry a missing OCR page",pending,
+                                format_func=lambda p:p.get('source_location',str(p['number'])))
+            if st.button("🔄 Retry selected page OCR",use_container_width=True):
+                try:
+                    spread.retry_page(store,ROOT,chosen,target['number'],spread_ocr_call)
+                    st.session_state.store_version=st.session_state.get('store_version',0)+1
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Retry failed: {type(e).__name__}: {str(e)[:180]}")
+        if stats['english_missing'] and st.button("🌐 Translate next 8 pages to English",use_container_width=True):
+            try:
+                count=run_spread_translation(store,chosen,limit=8)
+                st.success(f"Saved {count} translated page sides")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Translation failed: {type(e).__name__}: {str(e)[:180]}")
+        with st.expander("Page-by-page quality report"):
+            for p in logical_pages[:400]:
+                st.caption(f"{p.get('source_location',p['number'])}: {p.get('ocr_status','unknown')} · Kannada characters {len(p.get('kn',''))} · English {'ready' if p.get('en') else 'pending'}")
+    st.divider()
+    st.subheader("📥 Add files to knowledge")
+    files = st.file_uploader("Upload PDFs, Word, Excel, CSV, TXT, Markdown and more", type=sorted(SUPPORTED), accept_multiple_files=True,
+                             help="Accepted: PDF, DOCX/DOC, XLSX/XLS, CSV/TSV, TXT, Markdown, JSON, HTML, PPTX, RTF, ODT/ODS. Text + metadata are retained privately. Max 30 MB each.")
     auto_translate = st.checkbox("Also translate pages to English during upload (slower; uses Gemini quota)", value=False,
                                  help="Fast default: save Kannada text first. Use the translation button afterwards to add English indexing permanently.")
     if st.button("📚 Save to knowledge base", type="primary", use_container_width=True, disabled=not files or bool(storage_error)):
         for f in files:
             try:
-                ingest_pdf(f, store, docs, auto_translate=auto_translate)
+                ingest_any(f, store, docs, auto_translate=auto_translate)
             except Exception as e:
-                st.error(f"Unable to save {f.name}: {type(e).__name__}. Review private storage permissions or file processing.")
+                st.error(f"Unable to save {f.name}: {type(e).__name__}: {str(e)[:220]}")
         st.rerun()
     st.divider()
     with st.expander("Stored files / ಪ್ರಸ್ತುತ ದಾಖಲೆಗಳು"):
@@ -525,7 +762,7 @@ with st.sidebar:
             st.caption(f"📄 {d['name']} — {d.get('stored_pages', 0)}/{d.get('total_pages', 0)} pages • {d.get('status', 'unknown')}")
         if not docs:
             st.caption("No documents saved yet")
-    pending_scans = sum(1 for d in docs for p in d.get("pages", []) if p.get("method", "").startswith("OCR pending"))
+    pending_scans = sum(1 for d in docs for p in d.get("pages", []) if p.get("method", "").startswith("OCR pending") and d.get("pipeline_version") != spread.VERSION)
     if pending_scans and st.button(f"🔄 Retry pending OCR ({pending_scans} scans)", use_container_width=True):
         with st.spinner("Recovering saved scanned pages without PDF reupload..."):
             recovered = sum(retry_saved_ocr(d, store) for d in docs)
@@ -535,7 +772,8 @@ with st.sidebar:
         with st.spinner("Filling missing translations..."):
             count = 0
             for doc in docs:
-                count += repair_translation(doc, store)
+                if doc.get("pipeline_version") != spread.VERSION:
+                    count += repair_translation(doc, store)
         st.success(f"Checked {count} pages with missing translations")
         st.rerun()
     if not persistent:
@@ -548,14 +786,58 @@ with st.sidebar:
     if st.button("Clear this chat", use_container_width=True):
         st.session_state.chat = []
         st.rerun()
+    st.divider()
+    st.subheader("🧠 V7 neural embeddings")
+    st.caption("Embeddings are saved in the private repository separately from your original PDFs, OCR and translations. Only new or changed passages are indexed.")
+    embedding_provider_label = st.selectbox("Embedding engine", list(PROVIDERS), key="v7_provider")
+    embedding_provider = PROVIDERS[embedding_provider_label]
+    active_embeddings = st.checkbox("Use neural search for questions", value=True, key="v7_semantic_on")
+    if embedding_provider == "bge_m3" and not setting('BGE_M3_URL'):
+        st.info("BGE-M3 needs a separate private GPU/large-RAM worker. Configure BGE_M3_URL and BGE_M3_TOKEN in Secrets. It is not bundled into free Streamlit's memory.")
+    if embedding_provider == "gemini2" and not setting('GEMINI_API_KEY'):
+        st.warning("Gemini API key is missing; offline search remains available.")
+    st.caption("Translation options: Gemini (default), Google Cloud Translation (paid API), or your own authenticated IndicTrans2 endpoint. Source Kannada is always kept.")
+    if st.button("🔬 Index next 12 passages", use_container_width=True, disabled=bool(storage_error) or not persistent):
+        st.session_state.v7_index_request = True
 
+# Once a source has been reindexed successfully as left/right Unicode OCR,
+# suppress an older legacy-text copy of the SAME PDF from retrieval only.
+# The older records remain permanently intact in the private repository.
+superseded_old_ids = {
+    d.get('source_sha256', '')[:24] for d in docs
+    if d.get('pipeline_version') == spread.VERSION
+    and d.get('stored_pages', 0) == d.get('total_pages', 0)
+    and d.get('pages')
+    and all(p.get('ocr_status') != 'pending' for p in d.get('pages', []))
+}
 chunks = []
 for doc in docs:
+    if doc.get('pipeline_version') != spread.VERSION and doc.get('id') in superseded_old_ids:
+        continue
     chunks.extend(chunks_from_document(doc))
 index = build_search_index(json.dumps(chunks, ensure_ascii=False)) if chunks else None
 
+# AFTER the source search index is built; work only on explicitly requested batches.
+if st.session_state.pop('v7_index_request', False):
+    try:
+        provider=PROVIDERS[st.session_state.get('v7_provider','Gemini Embedding 2')]
+        with st.spinner('Generating and saving a checkpoint of real neural vectors...'):
+            info=neural_index_batch(
+                store, provider, chunks,
+                client=client_for_key(setting('GEMINI_API_KEY')) if provider=='gemini2' and setting('GEMINI_API_KEY') else None,
+                bge_url=setting('BGE_M3_URL'), bge_token=setting('BGE_M3_TOKEN'),limit=12)
+        st.success(f"{info['indexed']} new vectors saved; {info['remaining']} passages still pending. Total: {info['total']}.")
+    except Exception as exc:
+        st.warning('Neural indexing paused: '+message_for_error(exc)+' Offline hybrid search is still available.')
+
 mode = st.radio("Answer mode", ["Auto · smart routing", "Documents only · evidence", "General AI chat"], horizontal=True)
-st.caption(f"📚 {len(docs)} saved documents · {len(chunks)} searchable passages · Kannada/English hybrid search (offline, no embedding API quota)")
+st.caption(f"📚 {len(docs)} saved documents · {len(chunks)} searchable passages · local search always available · neural embeddings indexed separately")
+try:
+    _p=PROVIDERS[st.session_state.get('v7_provider','Gemini Embedding 2')]
+    _m=neural_manifest(store,_p)
+    st.caption(f"🧠 {_p} stored vectors: {_m.get('count',0)} / {len(chunks)} passages (may include older changed versions)")
+except Exception:
+    st.caption('🧠 Neural index status unavailable; local search still works')
 missing_en = sum(1 for d in docs for p in d.get("pages", []) if p.get("kn") and not p.get("en"))
 if missing_en:
     st.info(f"🌐 {missing_en} pages still need English translations. Kannada search is ready; English search improves after selecting 'Add / resume English translations' in the sidebar.")
@@ -569,7 +851,7 @@ for item in st.session_state.chat:
         if item.get("sources"):
             with st.expander("📖 Source passages / ಮೂಲ ಪುಟಗಳು"):
                 for i, c in enumerate(item["sources"], 1):
-                    st.markdown(f"**[{i}] {c['filename']} — page {c['page']}**")
+                    st.markdown(f"**[{i}] {c['filename']} — {c.get('source_location') or ('page '+str(c['page']))}**")
                     st.caption((c.get("kn") or c.get("en") or "")[:1300])
         if item["role"] == "assistant" and st.button("🔊 Listen / ಕೇಳಿ", key=f"voice_{item['id']}"):
             try:
@@ -595,7 +877,21 @@ if q:
     routed_doc = mode.startswith("Documents") or (mode.startswith("Auto") and bool(docs) and is_document_question(q))
     lookup_q = contextual_query(q, st.session_state.chat[:-1]) if routed_doc else q
     catalogue_mode = routed_doc and is_catalogue_question(q)
-    found, diagnostics = find_sources(lookup_q, index) if routed_doc and not catalogue_mode else ([], {})
+    found, diagnostics = find_sources(lookup_q, index, k=16) if routed_doc and not catalogue_mode else ([], {})
+    if routed_doc and not catalogue_mode and st.session_state.get('v7_semantic_on',True) and persistent:
+        try:
+            provider=PROVIDERS[st.session_state.get('v7_provider','Gemini Embedding 2')]
+            neural_results,neural_diagnostics=neural_search(
+                lookup_q,provider,chunks,store,
+                client=client_for_key(setting('GEMINI_API_KEY')) if provider=='gemini2' and setting('GEMINI_API_KEY') else None,
+                bge_url=setting('BGE_M3_URL'),bge_token=setting('BGE_M3_TOKEN'),k=16)
+            if neural_results:
+                found=combine_ranked(found,neural_results,limit=16)
+                diagnostics={**diagnostics,'v7_semantic':neural_diagnostics,'v7_provider':provider,'fusion':'reciprocal rank fusion'}
+            else:
+                diagnostics={**diagnostics,'v7_semantic':neural_diagnostics,'semantic_status':'not yet indexed; using local retrieval'}
+        except Exception as err:
+            diagnostics={**diagnostics,'semantic_status':'Unavailable; local BM25/TF-IDF used', 'semantic_error':message_for_error(err)}
     warning = None
     with st.spinner("Searching saved knowledge / ಉತ್ತರ ಹುಡುಕುತ್ತಿದೆ…"):
         if routed_doc:

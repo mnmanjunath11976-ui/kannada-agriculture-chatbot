@@ -28,7 +28,7 @@ import streamlit as st
 from gtts import gTTS
 from google import genai
 from google.genai import types
-from sklearn.feature_extraction.text import TfidfVectorizer
+from retrieval import HybridIndex, contextual_query, likely_document_question
 
 st.set_page_config(page_title="ಕೃಷಿ ಜ್ಞಾನ | Agri Knowledge Hub", page_icon="🌾", layout="wide", initial_sidebar_state="expanded")
 st.markdown('''<style>
@@ -401,34 +401,13 @@ def repair_translation(doc, store):
 @st.cache_resource(show_spinner=False)
 def build_search_index(chunks_payload):
     chunks = json.loads(chunks_payload)
-    if not chunks:
-        return None
-    content = [(p.get("kn", "") + "\n" + p.get("en", "")).strip() for p in chunks]
-    vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(2,4), max_features=60000, min_df=1, sublinear_tf=True)
-    matrix = vectorizer.fit_transform(content)
-    return chunks, vectorizer, matrix
+    return HybridIndex(chunks) if chunks else None
 
 
-def find_sources(query, index, k=6):
+def find_sources(query, index, k=7):
     if index is None:
-        return []
-    chunks, vectorizer, matrix = index
-    question = vectorizer.transform([query])
-    scores = np.asarray(matrix.dot(question.T).toarray()).ravel()
-    order = np.argsort(-scores)
-    results, by_page = [], Counter()
-    for i in order:
-        if scores[i] < 0.035:
-            break
-        c = chunks[int(i)]
-        key = (c["docid"], c["page"])
-        if by_page[key] >= 2:
-            continue
-        results.append({**c, "score": round(float(scores[i]), 3)})
-        by_page[key] += 1
-        if len(results) >= k:
-            break
-    return results
+        return [], {"message": "Empty knowledge base", "concepts": []}
+    return index.search(query, k=k)
 
 
 def normalize_question(q):
@@ -440,8 +419,7 @@ def is_greeting(q):
 
 
 def is_document_question(q):
-    tokens = ["pdf", "document", "manual", "pop", "ಪುಸ್ತಕ", "ದಾಖಲೆ", "ಬೆಳೆ", "ರೋಗ", "ಗೊಬ್ಬರ", "ಔಷಧ", "ಕೃಷಿ", "ಬಿತ್ತನೆ", "fertilizer", "pesticide", "crop", "yield", "soil", "sowing", "irrigation", "dose", "seed", "page", "ಉದ್ದು"]
-    return any(t in q.lower() for t in tokens)
+    return likely_document_question(q, st.session_state.get("chat", []))
 
 
 def conversational_answer(q):
@@ -527,6 +505,7 @@ with st.sidebar:
     else:
         st.warning("Add GEMINI_API_KEY in Streamlit Secrets for OCR, translation, AI and voice questions.")
     st.divider()
+    st.caption("🔍 Hybrid retrieval uses local BM25 + Kannada/English crop synonyms + TF-IDF. No Gemini embedding requests.")
     st.subheader("📥 Add PDF to knowledge")
     files = st.file_uploader("Upload Kannada / English PDFs", type=["pdf"], accept_multiple_files=True,
                              help="On successful indexing, OCR and searchable content are saved to the private knowledge repository.")
@@ -575,7 +554,7 @@ for doc in docs:
 index = build_search_index(json.dumps(chunks, ensure_ascii=False)) if chunks else None
 
 mode = st.radio("Answer mode", ["Auto · smart routing", "Documents only · evidence", "General AI chat"], horizontal=True)
-st.caption(f"📚 {len(docs)} saved documents · {len(chunks)} searchable passages · local search (no embedding API quota)")
+st.caption(f"📚 {len(docs)} saved documents · {len(chunks)} searchable passages · Kannada/English hybrid search (offline, no embedding API quota)")
 missing_en = sum(1 for d in docs for p in d.get("pages", []) if p.get("kn") and not p.get("en"))
 if missing_en:
     st.info(f"🌐 {missing_en} pages still need English translations. Kannada search is ready; English search improves after selecting 'Add / resume English translations' in the sidebar.")
@@ -583,6 +562,9 @@ if missing_en:
 for item in st.session_state.chat:
     with st.chat_message(item["role"]):
         st.markdown(item["text"])
+        if item.get("diagnostics") and item.get("routed_doc"):
+            with st.expander("🔎 Search details / ಹುಡುಕಾಟ ವಿವರ"):
+                st.json(item["diagnostics"])
         if item.get("sources"):
             with st.expander("📖 Source passages / ಮೂಲ ಪುಟಗಳು"):
                 for i, c in enumerate(item["sources"], 1):
@@ -610,12 +592,17 @@ if q:
     st.session_state.chat.append({"role": "user", "text": q, "id": len(st.session_state.chat)})
     greeting = is_greeting(q)
     routed_doc = mode.startswith("Documents") or (mode.startswith("Auto") and bool(docs) and is_document_question(q))
-    found = find_sources(q, index) if routed_doc else []
+    lookup_q = contextual_query(q, st.session_state.chat[:-1]) if routed_doc else q
+    found, diagnostics = find_sources(lookup_q, index) if routed_doc else ([], {})
     warning = None
     with st.spinner("Searching saved knowledge / ಉತ್ತರ ಹುಡುಕುತ್ತಿದೆ…"):
         if routed_doc:
+            if diagnostics.get("quality") == "weak" and found:
+                st.info("Search matches are weak. Please verify source passages before using agricultural quantities.")
             if not found:
                 ans = "ಈ ಪ್ರಶ್ನೆಗೆ ಹೊಂದುವ ಮಾಹಿತಿ ಸಂಗ್ರಹಿತ ದಾಖಲೆಗಳಲ್ಲಿ ಕಂಡುಬಂದಿಲ್ಲ." if any('\u0c80' <= x <= '\u0cff' for x in q) else "I couldn't find a relevant passage in the saved documents. Try different terms."
+            elif diagnostics.get("quality") == "weak":
+                ans = fallback_sources(found, q) + "\n\n⚠️ Search confidence is low. These are possible matches, not verified recommendations."
             else:
                 try:
                     ans = doc_answer(q, found)
@@ -627,8 +614,8 @@ if q:
                 ans = conversational_answer(q)
             except Exception as e:
                 warning = str(e)
-                ans = "Gemini is currently unavailable. You can still search saved PDFs in Documents mode." if not greeting else conversational_answer(q)
-    st.session_state.chat.append({"role": "assistant", "text": ans, "sources": found, "id": len(st.session_state.chat)})
+                ans = "Gemini is currently unavailable. You can still search saved PDFs in Documents mode."
+    st.session_state.chat.append({"role": "assistant", "text": ans, "sources": found, "diagnostics": diagnostics, "routed_doc": routed_doc, "id": len(st.session_state.chat)})
     if warning:
         st.toast("AI unavailable; showing saved knowledge where possible.")
     st.rerun()
